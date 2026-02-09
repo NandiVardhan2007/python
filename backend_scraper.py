@@ -13,7 +13,7 @@ CORS(app)
 
 # ---------- Config ----------
 LEETCODE_USERNAME = os.environ.get("LEETCODE_USERNAME", "Nandu_2007_")  # or set in Render env
-SCHEDULER_INTERVAL_HOURS = int(os.environ.get("SCHEDULER_INTERVAL_HOURS", 6))
+SCHEDULER_INTERVAL_HOURS = int(os.environ.get("SCHEDULER_INTERVAL_HOURS", 1))
 DISABLE_SCHEDULER = os.environ.get("DISABLE_SCHEDULER", "0") == "1"
 # ----------------------------
 
