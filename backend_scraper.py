@@ -7,12 +7,21 @@ import json
 import os
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
+import atexit
+import logging
 
 app = Flask(__name__)
 CORS(app)
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # ---------- Config ----------
-LEETCODE_USERNAME = os.environ.get("LEETCODE_USERNAME", "Nandu_2007_")  # or set in Render env
+LEETCODE_USERNAME = os.environ.get("LEETCODE_USERNAME", "Nandu_2007_")
 SCHEDULER_INTERVAL_HOURS = int(os.environ.get("SCHEDULER_INTERVAL_HOURS", 1))
 DISABLE_SCHEDULER = os.environ.get("DISABLE_SCHEDULER", "0") == "1"
 # ----------------------------
@@ -20,12 +29,14 @@ DISABLE_SCHEDULER = os.environ.get("DISABLE_SCHEDULER", "0") == "1"
 # Store cached data
 cached_data = {
     "leetcode": None,
-    "last_updated": None
+    "last_updated": None,
+    "update_count": 0  # Track how many times we've updated
 }
 
 def scrape_leetcode(username):
     """Scrape LeetCode stats using LeetCode GraphQL."""
     try:
+        logger.info(f"Starting LeetCode scrape for user: {username}")
         url = "https://leetcode.com/graphql"
         query = """
         query getUserProfile($username: String!) {
@@ -61,16 +72,32 @@ def scrape_leetcode(username):
             }
         }
         """
-        headers = {'Content-Type': 'application/json', 'Referer': f'https://leetcode.com/{username}/'}
-        response = requests.post(url, json={'query': query, 'variables': {'username': username}}, headers=headers, timeout=10)
+        headers = {
+            'Content-Type': 'application/json', 
+            'Referer': f'https://leetcode.com/{username}/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.post(
+            url, 
+            json={'query': query, 'variables': {'username': username}}, 
+            headers=headers, 
+            timeout=10
+        )
         response.raise_for_status()
         data = response.json()
 
-        calendar_response = requests.post(url, json={'query': calendar_query, 'variables': {'username': username}}, headers=headers, timeout=10)
+        calendar_response = requests.post(
+            url, 
+            json={'query': calendar_query, 'variables': {'username': username}}, 
+            headers=headers, 
+            timeout=10
+        )
         calendar_response.raise_for_status()
         calendar_data = calendar_response.json()
 
         if 'errors' in data or 'errors' in calendar_data:
+            logger.error(f"GraphQL errors in response: {data.get('errors', calendar_data.get('errors'))}")
             return None
 
         user_data = data.get('data', {}).get('matchedUser', {}) or {}
@@ -87,10 +114,11 @@ def scrape_leetcode(username):
         if calendar.get('submissionCalendar'):
             try:
                 submission_calendar = json.loads(calendar.get('submissionCalendar', '{}'))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to parse submission calendar: {e}")
                 submission_calendar = {}
 
-        return {
+        result = {
             'username': username,
             'total_solved': stats['Easy'] + stats['Medium'] + stats['Hard'],
             'easy': stats['Easy'],
@@ -105,64 +133,110 @@ def scrape_leetcode(username):
             'total_active_days': calendar.get('totalActiveDays', 0),
             'submission_calendar': submission_calendar
         }
+        
+        logger.info(f"Successfully scraped LeetCode data: {stats['Easy']+stats['Medium']+stats['Hard']} problems solved")
+        return result
+        
     except Exception as e:
-        app.logger.exception("Error scraping LeetCode")
+        logger.exception("Error scraping LeetCode")
         return None
 
 def update_all_stats():
     """Fetch and update cached_data."""
-    app.logger.info(f"Updating stats at {datetime.now().isoformat()}")
+    logger.info(f"⏰ Scheduled update triggered at {datetime.now().isoformat()}")
     try:
         leetcode_data = scrape_leetcode(LEETCODE_USERNAME)
         if leetcode_data:
             cached_data['leetcode'] = leetcode_data
+            cached_data['update_count'] += 1
+            logger.info(f"✅ Stats updated successfully (Update #{cached_data['update_count']})")
+        else:
+            logger.error("❌ Failed to fetch LeetCode data")
+            
         cached_data['last_updated'] = datetime.now().isoformat()
-        app.logger.info("Stats updated successfully")
+        
     except Exception:
-        app.logger.exception("Failed to update stats")
+        logger.exception("Failed to update stats")
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
+    """Return cached stats."""
+    logger.info(f"Stats requested - Last updated: {cached_data.get('last_updated', 'Never')}")
     return jsonify(cached_data)
+
+@app.route('/api/refresh', methods=['POST'])
+def force_refresh():
+    """Manually trigger a stats update."""
+    logger.info("Manual refresh triggered")
+    update_all_stats()
+    return jsonify({
+        'status': 'success', 
+        'message': 'Stats refreshed',
+        'last_updated': cached_data.get('last_updated')
+    })
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+    """Health check endpoint."""
+    return jsonify({
+        'status': 'healthy', 
+        'timestamp': datetime.now().isoformat(),
+        'last_updated': cached_data.get('last_updated'),
+        'update_count': cached_data.get('update_count', 0),
+        'scheduler_enabled': not DISABLE_SCHEDULER
+    })
 
 # -------------------------
 # Scheduler initialization
 # -------------------------
-_scheduler = None
+scheduler = None
 
-def _start_scheduler_if_needed():
-    global _scheduler
+def start_scheduler():
+    """Initialize and start the background scheduler."""
+    global scheduler
+    
     if DISABLE_SCHEDULER:
-        app.logger.info("Scheduler disabled via DISABLE_SCHEDULER env var.")
+        logger.info("📛 Scheduler disabled via DISABLE_SCHEDULER env var.")
         return
 
-    # Prevent starting multiple times if module reloaded
-    if _scheduler is not None:
+    if scheduler is not None:
+        logger.warning("Scheduler already running, skipping initialization")
         return
 
-    _scheduler = BackgroundScheduler()
-    # Run the update job periodically
-    _scheduler.add_job(func=update_all_stats, trigger="interval", hours=SCHEDULER_INTERVAL_HOURS, id="update_stats_job", replace_existing=True)
-    _scheduler.start()
-    # Run once on startup to populate cache
+    logger.info(f"🚀 Starting scheduler (interval: {SCHEDULER_INTERVAL_HOURS} hour(s))")
+    scheduler = BackgroundScheduler(daemon=True)
+    
+    # Add the periodic job
+    scheduler.add_job(
+        func=update_all_stats, 
+        trigger="interval", 
+        hours=SCHEDULER_INTERVAL_HOURS, 
+        id="update_stats_job", 
+        replace_existing=True,
+        max_instances=1  # Prevent overlapping runs
+    )
+    
+    scheduler.start()
+    logger.info("✅ Scheduler started successfully")
+    
+    # Initial update on startup
     try:
+        logger.info("Running initial stats update...")
         update_all_stats()
     except Exception:
-        app.logger.exception("Initial update failed")
+        logger.exception("Initial update failed")
 
-# Start scheduler when module is imported (Gunicorn imports this module)
-# For Flask dev server with reloader, ensure we start only on the actual child process
-if os.environ.get("WERKZEUG_RUN_MAIN") is None or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-    _start_scheduler_if_needed()
+    # Register shutdown handler
+    atexit.register(lambda: scheduler.shutdown() if scheduler else None)
+
+# Start scheduler when the module is loaded
+# Only start in the main process (not reloader process)
+if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    start_scheduler()
 
 # -------------------------
 # Local dev entrypoint
 # -------------------------
 if __name__ == '__main__':
     # Local development server (not used by gunicorn)
-    # Use a small timeout to make dev quicker if needed
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=True)
