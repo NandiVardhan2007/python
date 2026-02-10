@@ -164,7 +164,7 @@ def get_stats():
     logger.info(f"Stats requested - Last updated: {cached_data.get('last_updated', 'Never')}")
     return jsonify(cached_data)
 
-@app.route('/api/refresh', methods=['POST'])
+@app.route('/api/refresh', methods=['GET', 'POST'])
 def force_refresh():
     """Manually trigger a stats update."""
     logger.info("Manual refresh triggered")
@@ -172,7 +172,8 @@ def force_refresh():
     return jsonify({
         'status': 'success', 
         'message': 'Stats refreshed',
-        'last_updated': cached_data.get('last_updated')
+        'last_updated': cached_data.get('last_updated'),
+        'update_count': cached_data.get('update_count', 0)
     })
 
 @app.route('/api/health', methods=['GET'])
