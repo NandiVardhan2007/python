@@ -1,4 +1,4 @@
-# backend_scraper.py
+# backend_scraper.py - FIXED VERSION
 from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
@@ -30,7 +30,9 @@ DISABLE_SCHEDULER = os.environ.get("DISABLE_SCHEDULER", "0") == "1"
 cached_data = {
     "leetcode": None,
     "last_updated": None,
-    "update_count": 0  # Track how many times we've updated
+    "last_successful_update": None,  # NEW: Track when we actually got valid data
+    "update_count": 0,
+    "failed_attempts": 0  # NEW: Track failed attempts
 }
 
 def scrape_leetcode(username):
@@ -104,6 +106,11 @@ def scrape_leetcode(username):
         contest_data = data.get('data', {}).get('userContestRanking', {}) or {}
         calendar = calendar_data.get('data', {}).get('matchedUser', {}).get('userCalendar', {}) or {}
 
+        # Validate that we got actual user data
+        if not user_data:
+            logger.error(f"No user data found for username: {username}")
+            return None
+
         stats = {'Easy': 0, 'Medium': 0, 'Hard': 0}
         for item in user_data.get('submitStats', {}).get('acSubmissionNum', []) or []:
             difficulty = item.get('difficulty', '')
@@ -134,57 +141,104 @@ def scrape_leetcode(username):
             'submission_calendar': submission_calendar
         }
         
-        logger.info(f"Successfully scraped LeetCode data: {stats['Easy']+stats['Medium']+stats['Hard']} problems solved")
+        logger.info(f"✅ Successfully scraped LeetCode data: {stats['Easy']+stats['Medium']+stats['Hard']} problems solved")
         return result
         
+    except requests.exceptions.Timeout:
+        logger.error("⏱️ Request timed out while scraping LeetCode")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"🌐 Network error scraping LeetCode: {e}")
+        return None
     except Exception as e:
-        logger.exception("Error scraping LeetCode")
+        logger.exception("❌ Unexpected error scraping LeetCode")
         return None
 
 def update_all_stats():
-    """Fetch and update cached_data."""
+    """Fetch and update cached_data - FIXED VERSION."""
     logger.info(f"⏰ Scheduled update triggered at {datetime.now().isoformat()}")
+    
+    # Always update the last_updated timestamp (when we tried)
+    cached_data['last_updated'] = datetime.now().isoformat()
+    
     try:
         leetcode_data = scrape_leetcode(LEETCODE_USERNAME)
+        
         if leetcode_data:
+            # SUCCESS: Update the cached data
             cached_data['leetcode'] = leetcode_data
             cached_data['update_count'] += 1
-            logger.info(f"✅ Stats updated successfully (Update #{cached_data['update_count']})")
-        else:
-            logger.error("❌ Failed to fetch LeetCode data")
+            cached_data['last_successful_update'] = datetime.now().isoformat()
+            cached_data['failed_attempts'] = 0  # Reset failed attempts counter
             
-        cached_data['last_updated'] = datetime.now().isoformat()
-        
-    except Exception:
-        logger.exception("Failed to update stats")
+            logger.info(f"✅ Stats updated successfully (Update #{cached_data['update_count']})")
+            logger.info(f"📊 Total Solved: {leetcode_data['total_solved']} (E:{leetcode_data['easy']}, M:{leetcode_data['medium']}, H:{leetcode_data['hard']})")
+            return True
+        else:
+            # FAILURE: Keep old data but track the failure
+            cached_data['failed_attempts'] += 1
+            logger.error(f"❌ Failed to fetch LeetCode data (Failure #{cached_data['failed_attempts']})")
+            
+            # If we have old data, keep using it
+            if cached_data['leetcode']:
+                logger.warning(f"⚠️ Keeping previous cached data from {cached_data.get('last_successful_update', 'unknown')}")
+            
+            return False
+            
+    except Exception as e:
+        cached_data['failed_attempts'] += 1
+        logger.exception(f"❌ Exception in update_all_stats (Failure #{cached_data['failed_attempts']}): {e}")
+        return False
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     """Return cached stats."""
-    logger.info(f"Stats requested - Last updated: {cached_data.get('last_updated', 'Never')}")
+    logger.info(f"📊 Stats requested - Last updated: {cached_data.get('last_updated', 'Never')}, Last successful: {cached_data.get('last_successful_update', 'Never')}")
+    
+    # Return the full cached_data so frontend knows about failed attempts
     return jsonify(cached_data)
 
 @app.route('/api/refresh', methods=['GET', 'POST'])
 def force_refresh():
     """Manually trigger a stats update."""
-    logger.info("Manual refresh triggered")
-    update_all_stats()
-    return jsonify({
-        'status': 'success', 
-        'message': 'Stats refreshed',
-        'last_updated': cached_data.get('last_updated'),
-        'update_count': cached_data.get('update_count', 0)
-    })
+    logger.info("🔄 Manual refresh triggered")
+    
+    # Attempt the update
+    success = update_all_stats()
+    
+    if success:
+        return jsonify({
+            'status': 'success', 
+            'message': 'Stats refreshed successfully',
+            'last_updated': cached_data.get('last_updated'),
+            'last_successful_update': cached_data.get('last_successful_update'),
+            'update_count': cached_data.get('update_count', 0),
+            'leetcode': cached_data.get('leetcode')  # Include the actual data
+        })
+    else:
+        return jsonify({
+            'status': 'error',
+            'message': 'Failed to refresh stats',
+            'last_updated': cached_data.get('last_updated'),
+            'last_successful_update': cached_data.get('last_successful_update'),
+            'failed_attempts': cached_data.get('failed_attempts', 0),
+            'leetcode': cached_data.get('leetcode')  # Return old data if available
+        }), 500
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
+    has_data = cached_data.get('leetcode') is not None
+    
     return jsonify({
         'status': 'healthy', 
         'timestamp': datetime.now().isoformat(),
         'last_updated': cached_data.get('last_updated'),
+        'last_successful_update': cached_data.get('last_successful_update'),
         'update_count': cached_data.get('update_count', 0),
-        'scheduler_enabled': not DISABLE_SCHEDULER
+        'failed_attempts': cached_data.get('failed_attempts', 0),
+        'scheduler_enabled': not DISABLE_SCHEDULER,
+        'has_cached_data': has_data
     })
 
 # -------------------------
@@ -197,7 +251,7 @@ def start_scheduler():
     global scheduler
     
     if DISABLE_SCHEDULER:
-        logger.info("📛 Scheduler disabled via DISABLE_SCHEDULER env var.")
+        logger.info("🔒 Scheduler disabled via DISABLE_SCHEDULER env var.")
         return
 
     if scheduler is not None:
@@ -223,9 +277,13 @@ def start_scheduler():
     # Initial update on startup
     try:
         logger.info("Running initial stats update...")
-        update_all_stats()
-    except Exception:
-        logger.exception("Initial update failed")
+        success = update_all_stats()
+        if success:
+            logger.info("🎉 Initial update completed successfully")
+        else:
+            logger.warning("⚠️ Initial update failed, will retry on next scheduled run")
+    except Exception as e:
+        logger.exception(f"❌ Initial update failed with exception: {e}")
 
     # Register shutdown handler
     atexit.register(lambda: scheduler.shutdown() if scheduler else None)
