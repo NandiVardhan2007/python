@@ -9,6 +9,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
 import atexit
 import logging
+import threading
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -288,10 +290,23 @@ def start_scheduler():
     # Register shutdown handler
     atexit.register(lambda: scheduler.shutdown() if scheduler else None)
 
+def start_keep_alive():
+    def ping():
+        while True:
+            try:
+                time.sleep(600)  # 10 minutes
+                url = os.environ.get("RENDER_EXTERNAL_URL", "https://python-1w2h.onrender.com")
+                logger.info(f"Sending keep-alive ping to {url}/api/health")
+                requests.get(f"{url}/api/health", timeout=10)
+            except Exception as e:
+                logger.error(f"Keep-alive ping failed: {e}")
+    threading.Thread(target=ping, daemon=True).start()
+
 # Start scheduler when the module is loaded
 # Only start in the main process (not reloader process)
 if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     start_scheduler()
+    start_keep_alive()
 
 # -------------------------
 # Local dev entrypoint
